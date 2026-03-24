@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 
 
 class FileGrouper:
@@ -28,14 +28,13 @@ class FileGrouper:
         for item in self.source_path.iterdir():
             if (item.is_file() and
                     item.name != "move_log.json" and
-                    '-' in item.name and
-                    not any(p.name.endswith(suffix) for p in item.parents)):
+                    '-' in item.name):
                 if allowed is None or item.suffix.lower() in allowed:
                     files.append(item)
         return files
 
-    def preview_groups(self, filter_text: str, suffix: str, use_numbering: bool) -> Dict[str, List[Path]]:
-        """Return {final_folder_name: [files]} with optional numbering"""
+    def preview_groups(self, filter_text: str, suffix: str, use_numbering: bool, custom_names: List[str]) -> Dict[
+        str, List[Path]]:
         files = self.get_filtered_files(filter_text, suffix)
         temp_groups: Dict[str, List[Path]] = {}
 
@@ -44,12 +43,13 @@ class FileGrouper:
             if prefix:
                 temp_groups.setdefault(prefix, []).append(item)
 
-        # Sort prefixes alphabetically and generate final folder names
         sorted_prefixes = sorted(temp_groups.keys())
         final_groups: Dict[str, List[Path]] = {}
 
         for i, prefix in enumerate(sorted_prefixes):
-            if use_numbering:
+            if use_numbering and custom_names and i < len(custom_names):
+                folder_name = f"{i:02d}{custom_names[i]}"
+            elif use_numbering:
                 folder_name = f"{i:02d} - {prefix}{suffix}"
             else:
                 folder_name = f"{prefix}{suffix}"
@@ -57,8 +57,9 @@ class FileGrouper:
 
         return final_groups
 
-    def execute_move(self, filter_text: str, suffix: str, use_numbering: bool) -> Tuple[int, int]:
-        groups = self.preview_groups(filter_text, suffix, use_numbering)
+    def execute_move(self, filter_text: str, suffix: str, use_numbering: bool, custom_names: List[str]) -> Tuple[
+        int, int]:
+        groups = self.preview_groups(filter_text, suffix, use_numbering, custom_names)
         if not groups:
             return 0, 0
 
@@ -94,7 +95,8 @@ class FileGrouper:
         self._save_log(existing_log)
         return moved_count, skipped_count
 
-    def undo_last_move(self, filter_text: str, suffix: str) -> Tuple[int, int]:
+    def undo_last_move(self, filter_text: str) -> Tuple[int, int]:
+        """Undo with smart cleanup of ALL empty grouped folders (works for both modes)"""
         if not self.log_path.exists():
             return 0, 0
 
@@ -102,6 +104,7 @@ class FileGrouper:
         allowed = self.get_allowed_extensions(filter_text)
         to_keep = []
         undone_count = 0
+        folders_to_cleanup: Set[Path] = set()
 
         for item in log_data:
             dst = Path(item["moved_to"])
@@ -112,13 +115,14 @@ class FileGrouper:
                 try:
                     shutil.move(str(dst), str(original))
                     undone_count += 1
+                    folders_to_cleanup.add(dst.parent)  # Record the group folder
                 except Exception:
                     to_keep.append(item)
             else:
                 to_keep.append(item)
 
         self._save_log(to_keep)
-        self._cleanup_empty_folders(suffix)
+        self._cleanup_specific_folders(folders_to_cleanup)
         return undone_count, len(to_keep)
 
     def _load_log(self) -> List[dict]:
@@ -135,26 +139,25 @@ class FileGrouper:
         elif self.log_path.exists():
             self.log_path.unlink(missing_ok=True)
 
-    def _cleanup_empty_folders(self, suffix: str):
-        for folder in list(self.source_path.iterdir()):
-            if (folder.is_dir() and
-                    folder.name.endswith(suffix) and
-                    not any(folder.iterdir())):
+    def _cleanup_specific_folders(self, folders: Set[Path]):
+        """Delete all empty folders that were used in the last move operation"""
+        for folder in folders:
+            if folder.is_dir() and not any(folder.iterdir()):
                 try:
                     folder.rmdir()
                 except OSError:
-                    pass
+                    pass  # Usually OneDrive/Google Drive lock
 
 
 class FileGrouperApp:
     def __init__(self, master):
         self.master = master
 
-        # Declare all variables first
+        # Variables
         self.source_var = tk.StringVar()
         self.suffix_var = tk.StringVar(value="series")
         self.filter_var = tk.StringVar(value="")
-        self.numbering_var = tk.BooleanVar(value=False)  # 新增编号模式
+        self.numbering_var = tk.BooleanVar(value=False)
         self.source_path: Optional[Path] = None
         self.grouper: Optional[FileGrouper] = None
 
@@ -163,6 +166,7 @@ class FileGrouperApp:
         self.suffix_entry: Optional[tk.Entry] = None
         self.filter_entry: Optional[tk.Entry] = None
         self.numbering_check: Optional[tk.Checkbutton] = None
+        self.custom_names_text: Optional[scrolledtext.ScrolledText] = None
         self.browse_btn: Optional[tk.Button] = None
         self.preview_btn: Optional[tk.Button] = None
         self.execute_btn: Optional[tk.Button] = None
@@ -190,10 +194,11 @@ class FileGrouperApp:
         self.folder_entry = tk.Entry(source_frame, textvariable=self.source_var, font=("Arial", 10))
         self.folder_entry.pack(fill="x", pady=5)
 
-        # Suffix
+        # Suffix - 优化后的清晰提示
         suffix_frame = tk.Frame(self.master)
         suffix_frame.pack(fill="x", padx=20, pady=5)
-        tk.Label(suffix_frame, text="Folder Suffix:", font=("Arial", 10)).pack(anchor="w")
+        tk.Label(suffix_frame, text="Default Suffix (Simple Mode only - ignored when Numbered Custom Mode is enabled):",
+                 font=("Arial", 10)).pack(anchor="w")
         self.suffix_entry = tk.Entry(suffix_frame, textvariable=self.suffix_var, font=("Arial", 10))
         self.suffix_entry.pack(fill="x", pady=5)
 
@@ -204,16 +209,26 @@ class FileGrouperApp:
         self.filter_entry = tk.Entry(filter_frame, textvariable=self.filter_var, font=("Arial", 10))
         self.filter_entry.pack(fill="x", pady=5)
 
-        # 新增：Numbered Folders Mode（企业级核心功能）
+        # Numbered Mode - 优化后的清晰提示
         numbered_frame = tk.Frame(self.master)
         numbered_frame.pack(fill="x", padx=20, pady=8)
         self.numbering_check = tk.Checkbutton(
             numbered_frame,
-            text="Use Numbered Folders (00 - PrefixName... for sorting)",
+            text=" Enable Numbered Custom Mode (e.g. 00ACS, 01Delta, 02ED...)",
             variable=self.numbering_var,
-            font=("Arial", 10)
+            font=("Arial", 10, "bold")
         )
         self.numbering_check.pack(anchor="w")
+
+        # Custom Names - 优化后的清晰提示
+        custom_frame = tk.Frame(self.master)
+        custom_frame.pack(fill="x", padx=20, pady=5)
+        tk.Label(custom_frame,
+                 text="Custom Folder Names (one per line):\nThe program will automatically add '00', '01' etc. in alphabetical prefix order.",
+                 font=("Arial", 10)).pack(anchor="w")
+        self.custom_names_text = scrolledtext.ScrolledText(custom_frame, height=6, font=("Consolas", 10))
+        self.custom_names_text.pack(fill="x", pady=5)
+        self.custom_names_text.insert(tk.END, "ACS\nDelta\nED\nOP\nBGM")
 
         # Drag & Drop
         self.master.drop_target_register(DND_FILES)
@@ -248,7 +263,7 @@ class FileGrouperApp:
         # Log
         log_label = tk.Label(self.master, text="Enterprise Audit Log:", font=("Arial", 11, "bold"))
         log_label.pack(anchor="w", padx=20, pady=(10, 0))
-        self.preview_text = scrolledtext.ScrolledText(self.master, height=22, font=("Consolas", 10))
+        self.preview_text = scrolledtext.ScrolledText(self.master, height=20, font=("Consolas", 10))
         self.preview_text.pack(fill="both", expand=True, padx=20, pady=5)
 
         self.status_label = tk.Label(self.master, text="Ready for operation...", fg="gray", anchor="w")
@@ -313,23 +328,30 @@ class FileGrouperApp:
             self.progress_label.config(text=text)
             self.master.update_idletasks()
 
+    def get_custom_names(self) -> List[str]:
+        text = self.custom_names_text.get(1.0, tk.END).strip()
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
     def preview_groups(self):
         if not self.source_path or not self.grouper:
             messagebox.showerror("Error", "Please select a folder first!")
             return
 
         suffix = self.suffix_var.get().strip()
-        if not suffix:
-            messagebox.showerror("Error", "Folder Suffix cannot be empty!")
+        use_numbering = self.numbering_var.get()
+        custom_names = self.get_custom_names()
+
+        if not suffix and not use_numbering:
+            messagebox.showerror("Error", "Please enter a Default Suffix or enable Numbered Custom Mode!")
             return
 
         self.preview_text.delete(1.0, tk.END)
         self.log("=== PREVIEW START ===", "INFO")
 
-        use_numbering = self.numbering_var.get()
-        groups = self.grouper.preview_groups(self.filter_var.get(), suffix, use_numbering)
+        groups = self.grouper.preview_groups(self.filter_var.get(), suffix, use_numbering, custom_names)
 
-        self.log(f"Found {len(groups)} groups with {sum(len(files) for files in groups.values())} files", "INFO")
+        total_files = sum(len(files) for files in groups.values())
+        self.log(f"Found {len(groups)} groups with {total_files} files", "INFO")
 
         for folder_name, files in sorted(groups.items()):
             self.log(f"\n→ Final Folder: {folder_name}  ({len(files)} files)", "INFO")
@@ -340,14 +362,13 @@ class FileGrouperApp:
 
         self.log("=== PREVIEW COMPLETE ===", "INFO")
 
-        count = sum(len(f) for f in groups.values())
-        self.execute_btn.config(state="normal" if count > 0 else "disabled")
+        self.execute_btn.config(state="normal" if total_files > 0 else "disabled")
+
+        if use_numbering and not custom_names:
+            self.log("NOTE: No custom names provided → using fallback numbered naming", "WARNING")
 
     def execute_move(self):
         if not self.source_path or not self.grouper:
-            return
-        suffix = self.suffix_var.get().strip()
-        if not suffix:
             return
         if not messagebox.askyesno("Confirm", "Start moving files?"):
             return
@@ -355,8 +376,11 @@ class FileGrouperApp:
         self.log("=== MOVE OPERATION START ===", "INFO")
         self.reset_progress()
 
+        suffix = self.suffix_var.get().strip()
         use_numbering = self.numbering_var.get()
-        moved, skipped = self.grouper.execute_move(self.filter_var.get(), suffix, use_numbering)
+        custom_names = self.get_custom_names()
+
+        moved, skipped = self.grouper.execute_move(self.filter_var.get(), suffix, use_numbering, custom_names)
 
         self.log(f"SUMMARY: Successfully moved {moved} files | Skipped {skipped} conflicts", "SUCCESS")
         self.log("=== MOVE OPERATION COMPLETE ===", "INFO")
@@ -374,9 +398,8 @@ class FileGrouperApp:
             return
 
         self.log("=== UNDO OPERATION START ===", "INFO")
-        suffix = self.suffix_var.get().strip()
 
-        undone, remaining = self.grouper.undo_last_move(self.filter_var.get(), suffix)
+        undone, remaining = self.grouper.undo_last_move(self.filter_var.get())
 
         self.log(f"SUMMARY: Restored {undone} files | {remaining} records remaining", "SUCCESS")
         self.log("=== UNDO OPERATION COMPLETE ===", "INFO")
@@ -384,7 +407,8 @@ class FileGrouperApp:
         self.status_label.config(text=f"Undo completed ({undone} files)", fg="green")
         self.undo_btn.config(state="normal" if remaining > 0 else "disabled")
         self.reset_progress()
-        messagebox.showinfo("Undo Success", f"Successfully restored {undone} files.")
+        messagebox.showinfo("Undo Success",
+                            f"Successfully restored {undone} files.\nEmpty group folders have been automatically deleted.")
 
 
 if __name__ == "__main__":
