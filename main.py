@@ -22,7 +22,7 @@ class FileGrouper:
         exts = [ext.strip().lower() for ext in filter_text.split(',') if ext.strip()]
         return exts if exts else None
 
-    def get_filtered_files(self, filter_text: str, suffix: str) -> List[Path]:
+    def get_filtered_files(self, filter_text: str) -> List[Path]:
         allowed = self.get_allowed_extensions(filter_text)
         files = []
         for item in self.source_path.iterdir():
@@ -35,7 +35,7 @@ class FileGrouper:
 
     def preview_groups(self, filter_text: str, suffix: str, use_numbering: bool, custom_names: List[str]) -> Dict[
         str, List[Path]]:
-        files = self.get_filtered_files(filter_text, suffix)
+        files = self.get_filtered_files(filter_text)
         temp_groups: Dict[str, List[Path]] = {}
 
         for item in files:
@@ -96,7 +96,7 @@ class FileGrouper:
         return moved_count, skipped_count
 
     def undo_last_move(self, filter_text: str) -> Tuple[int, int]:
-        """Undo with smart cleanup of ALL empty grouped folders (works for both modes)"""
+        """Undo + full cleanup of ALL empty group folders (fixes multi-batch undo issue)"""
         if not self.log_path.exists():
             return 0, 0
 
@@ -115,14 +115,18 @@ class FileGrouper:
                 try:
                     shutil.move(str(dst), str(original))
                     undone_count += 1
-                    folders_to_cleanup.add(dst.parent)  # Record the group folder
+                    # 精确记录本次操作涉及的所有文件夹
+                    folders_to_cleanup.add(dst.parent)
                 except Exception:
                     to_keep.append(item)
             else:
                 to_keep.append(item)
 
         self._save_log(to_keep)
-        self._cleanup_specific_folders(folders_to_cleanup)
+
+        # 将精确追踪到的文件夹集合传入清理函数，同时兼容编号模式扫描
+        self._cleanup_all_empty_group_folders(folders_to_cleanup)
+
         return undone_count, len(to_keep)
 
     def _load_log(self) -> List[dict]:
@@ -139,14 +143,34 @@ class FileGrouper:
         elif self.log_path.exists():
             self.log_path.unlink(missing_ok=True)
 
-    def _cleanup_specific_folders(self, folders: Set[Path]):
-        """Delete all empty folders that were used in the last move operation"""
-        for folder in folders:
-            if folder.is_dir() and not any(folder.iterdir()):
-                try:
+    def _cleanup_all_empty_group_folders(self, known_folders: Set[Path] = None):
+        """
+        Delete ALL empty group folders (works for both Simple Mode and Numbered Custom Mode).
+
+        known_folders: 由 undo_last_move 精确追踪到的文件夹集合（含 Simple Mode 文件夹）。
+                       这是修复"按类型逐批归类再逐批撤回，最后一批撤回后残留文件夹"的关键。
+        """
+        candidates: Set[Path] = set()
+
+        # ① 优先使用精确追踪到的文件夹（同时覆盖 Simple Mode 和 Numbered Mode）
+        if known_folders:
+            candidates.update(known_folders)
+
+        # ② 兜底：扫描源目录下所有以两位数字开头的文件夹（Numbered Custom Mode）
+        for folder in self.source_path.iterdir():
+            if not folder.is_dir():
+                continue
+            name = folder.name
+            if len(name) >= 2 and name[0].isdigit() and name[1].isdigit():
+                candidates.add(folder)
+
+        # 统一处理：只删除真正为空的候选文件夹
+        for folder in candidates:
+            try:
+                if folder.is_dir() and not any(folder.iterdir()):
                     folder.rmdir()
-                except OSError:
-                    pass  # Usually OneDrive/Google Drive lock
+            except OSError:
+                pass  # 通常是 OneDrive / 系统锁定
 
 
 class FileGrouperApp:
@@ -187,14 +211,12 @@ class FileGrouperApp:
         title_label = tk.Label(self.master, text="File Grouper by Prefix", font=("Arial", 18, "bold"))
         title_label.pack(pady=12)
 
-        # Source Folder
         source_frame = tk.Frame(self.master)
         source_frame.pack(fill="x", padx=20, pady=5)
         tk.Label(source_frame, text="Source Folder:", font=("Arial", 10)).pack(anchor="w")
         self.folder_entry = tk.Entry(source_frame, textvariable=self.source_var, font=("Arial", 10))
         self.folder_entry.pack(fill="x", pady=5)
 
-        # Suffix - 优化后的清晰提示
         suffix_frame = tk.Frame(self.master)
         suffix_frame.pack(fill="x", padx=20, pady=5)
         tk.Label(suffix_frame, text="Default Suffix (Simple Mode only - ignored when Numbered Custom Mode is enabled):",
@@ -202,25 +224,23 @@ class FileGrouperApp:
         self.suffix_entry = tk.Entry(suffix_frame, textvariable=self.suffix_var, font=("Arial", 10))
         self.suffix_entry.pack(fill="x", pady=5)
 
-        # Filter
         filter_frame = tk.Frame(self.master)
         filter_frame.pack(fill="x", padx=20, pady=5)
         tk.Label(filter_frame, text="File Extensions Filter (blank = ALL):", font=("Arial", 10)).pack(anchor="w")
         self.filter_entry = tk.Entry(filter_frame, textvariable=self.filter_var, font=("Arial", 10))
         self.filter_entry.pack(fill="x", pady=5)
 
-        # Numbered Mode - 优化后的清晰提示
+        # Numbered Mode - 去掉 ✅ 符号
         numbered_frame = tk.Frame(self.master)
         numbered_frame.pack(fill="x", padx=20, pady=8)
         self.numbering_check = tk.Checkbutton(
             numbered_frame,
-            text=" Enable Numbered Custom Mode (e.g. 00ACS, 01Delta, 02ED...)",
+            text="Enable Numbered Custom Mode (e.g. 00ACS, 01Delta, 02ED...)",
             variable=self.numbering_var,
             font=("Arial", 10, "bold")
         )
         self.numbering_check.pack(anchor="w")
 
-        # Custom Names - 优化后的清晰提示
         custom_frame = tk.Frame(self.master)
         custom_frame.pack(fill="x", padx=20, pady=5)
         tk.Label(custom_frame,
@@ -230,11 +250,9 @@ class FileGrouperApp:
         self.custom_names_text.pack(fill="x", pady=5)
         self.custom_names_text.insert(tk.END, "ACS\nDelta\nED\nOP\nBGM")
 
-        # Drag & Drop
         self.master.drop_target_register(DND_FILES)
         self.master.dnd_bind('<<Drop>>', self.on_drop)
 
-        # Buttons
         btn_frame = tk.Frame(self.master)
         btn_frame.pack(pady=12)
         self.browse_btn = tk.Button(btn_frame, text="Browse...", command=self.browse_folder, width=12)
@@ -252,7 +270,6 @@ class FileGrouperApp:
                                     fg="white")
         self.export_btn.pack(side="left", padx=5)
 
-        # Progress
         progress_frame = tk.Frame(self.master)
         progress_frame.pack(fill="x", padx=20, pady=5)
         self.progress_label = tk.Label(progress_frame, text="Progress: Ready", font=("Arial", 9))
@@ -260,7 +277,6 @@ class FileGrouperApp:
         self.progress_bar = Progressbar(progress_frame, mode='determinate', length=800)
         self.progress_bar.pack(fill="x", pady=2)
 
-        # Log
         log_label = tk.Label(self.master, text="Enterprise Audit Log:", font=("Arial", 11, "bold"))
         log_label.pack(anchor="w", padx=20, pady=(10, 0))
         self.preview_text = scrolledtext.ScrolledText(self.master, height=20, font=("Consolas", 10))
@@ -364,9 +380,6 @@ class FileGrouperApp:
 
         self.execute_btn.config(state="normal" if total_files > 0 else "disabled")
 
-        if use_numbering and not custom_names:
-            self.log("NOTE: No custom names provided → using fallback numbered naming", "WARNING")
-
     def execute_move(self):
         if not self.source_path or not self.grouper:
             return
@@ -408,7 +421,7 @@ class FileGrouperApp:
         self.undo_btn.config(state="normal" if remaining > 0 else "disabled")
         self.reset_progress()
         messagebox.showinfo("Undo Success",
-                            f"Successfully restored {undone} files.\nEmpty group folders have been automatically deleted.")
+                            f"Successfully restored {undone} files.\nAll empty group folders have been automatically deleted.")
 
 
 if __name__ == "__main__":
