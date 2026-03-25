@@ -3,13 +3,20 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from tkinter.ttk import Progressbar, Combobox
-from tkinterdnd2 import TkinterDnD, DND_FILES
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
+except Exception:
+    # Drag-and-drop is optional; continue without it
+    HAS_DND = False
 from pathlib import Path
 import shutil
 import json
 from datetime import datetime
 import threading
 from typing import List, Dict, Optional, Tuple, Set
+import uuid
+import re
 
 
 class FileGrouper:
@@ -22,17 +29,27 @@ class FileGrouper:
     @staticmethod
     def get_allowed_extensions(filter_text: str) -> Optional[List[str]]:
         exts = [ext.strip().lower() for ext in filter_text.split(',') if ext.strip()]
-        return exts if exts else None
+        # Normalize to leading dot (e.g. 'jpg' -> '.jpg')
+        cleaned = []
+        for e in exts:
+            if not e.startswith('.'):
+                e = '.' + e
+            cleaned.append(e)
+        return cleaned if cleaned else None
 
     def get_filtered_files(self, filter_text: str) -> List[Path]:
         allowed = self.get_allowed_extensions(filter_text)
         files = []
-        for item in self.source_path.iterdir():
-            if (item.is_file() and
-                    item.name != "move_log.json" and
-                    '-' in item.name):
-                if allowed is None or item.suffix.lower() in allowed:
-                    files.append(item)
+        try:
+            for item in self.source_path.iterdir():
+                if (item.is_file() and
+                        item.name != "move_log.json" and
+                        '-' in item.name):
+                    if allowed is None or item.suffix.lower() in allowed:
+                        files.append(item)
+        except Exception:
+            # If source_path is not accessible, return empty and let caller handle
+            return []
         return files
 
     def preview_groups(self, filter_text: str, suffix: str, use_numbering: bool, custom_names: List[str],
@@ -56,13 +73,16 @@ class FileGrouper:
             display_prefix = temp_groups[key]["display_prefix"]
 
             if use_numbering:
-                # Smart numeric prefix mapping (e.g., "05" -> targets index 5)
+                # Smart numeric prefix mapping with bounds checking
                 try:
                     target_idx = int(display_prefix)
-                except ValueError:
+                    if target_idx < 0 or target_idx > 9999:
+                        target_idx = i
+                except (ValueError, OverflowError):
                     target_idx = i
 
-                if custom_names and target_idx < len(custom_names):
+                if custom_names and 0 <= target_idx < len(custom_names):
+                    # sanitize custom name usage will be handled by caller (UI)
                     folder_name = f"{target_idx:02d}{custom_names[target_idx]}"
                 else:
                     folder_name = f"{target_idx:02d} - {display_prefix}{suffix}"
@@ -99,7 +119,8 @@ class FileGrouper:
             return 0, 0, 0, 0
 
         existing_log = self._load_log()
-        batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Use uuid to avoid batch_id collisions
+        batch_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
         moved_count = 0
         skipped_count = 0
@@ -110,9 +131,20 @@ class FileGrouper:
 
         for folder_name, file_list in groups.items():
             target_folder = self.source_path / folder_name
-            target_folder.mkdir(exist_ok=True)
+            try:
+                target_folder.mkdir(exist_ok=True)
+            except Exception as e:
+                log_callback(f"Failed to create folder {target_folder}: {e}", "ERROR")
+                error_count += len(file_list)
+                continue
 
             for file_path in file_list:
+                # Ensure the source still exists
+                if not file_path.exists():
+                    log_callback(f"Source file missing (skipped): {file_path.name}", "WARN")
+                    skipped_count += 1
+                    continue
+
                 current += 1
                 progress_callback(current, total, file_path.name)
                 dst_path = target_folder / file_path.name
@@ -136,22 +168,40 @@ class FileGrouper:
                         renamed_count += 1
                         log_callback(f"Auto-Renamed to: {dst_path.name}", "INFO")
 
+                # Perform move and ensure log is persisted; if saving fails, attempt rollback
                 try:
                     shutil.move(str(file_path), str(dst_path))
-                    existing_log.append({
-                        "batch_id": batch_id,
-                        "original": str(file_path.resolve()),
-                        "moved_to": str(dst_path.resolve()),
-                        "group": folder_name,
-                        "extension": file_path.suffix.lower(),
-                        "timestamp": datetime.now().isoformat()
-                    })
-                    moved_count += 1
                 except Exception as e:
                     error_count += 1
                     log_callback(f"Move error for {file_path.name}: {e}", "ERROR")
+                    continue
 
-        self._save_log(existing_log)
+                entry = {
+                    "batch_id": batch_id,
+                    "original": str(file_path.resolve()),
+                    "moved_to": str(dst_path.resolve()),
+                    "group": folder_name,
+                    "extension": file_path.suffix.lower(),
+                    "timestamp": datetime.now().isoformat()
+                }
+
+                existing_log.append(entry)
+
+                # Try to save log immediately to reduce inconsistent state
+                try:
+                    self._save_log(existing_log)
+                    moved_count += 1
+                except Exception as e:
+                    # Attempt rollback: move file back to original location
+                    try:
+                        shutil.move(str(dst_path), str(Path(entry["original"])))
+                        error_count += 1
+                        existing_log.pop()  # remove failed entry
+                        log_callback(f"Move rolled back due to log save failure for {dst_path.name}: {e}", "ERROR")
+                    except Exception as e2:
+                        # If rollback fails, keep entry for later recovery and warn the user
+                        log_callback(f"CRITICAL: Log save failed and rollback failed for {dst_path.name}: {e} / {e2}", "ERROR")
+
         return moved_count, skipped_count, renamed_count, error_count
 
     def undo_last_move(self, progress_callback, log_callback) -> Tuple[int, int]:
@@ -185,6 +235,8 @@ class FileGrouper:
 
             if dst.exists():
                 try:
+                    # Ensure original folder exists
+                    original.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(dst), str(original))
                     undone_count += 1
                     folders_to_cleanup.add(dst.parent)
@@ -194,7 +246,12 @@ class FileGrouper:
             else:
                 log_callback(f"File missing for undo: {dst.name}", "WARN")
 
-        self._save_log(to_keep)
+        try:
+            # Persist kept logs (those not undone)
+            self._save_log(to_keep)
+        except Exception as e:
+            log_callback(f"Failed to update log after undo: {e}", "ERROR")
+
         self._cleanup_all_empty_group_folders(folders_to_cleanup, log_callback)
 
         return undone_count, len(to_keep)
@@ -206,17 +263,23 @@ class FileGrouper:
             candidates.update(known_folders)
 
         # Fallback scan for numbered folders
-        for folder in self.source_path.iterdir():
-            if not folder.is_dir(): continue
-            name = folder.name
-            if len(name) >= 2 and name[0].isdigit() and name[1].isdigit():
-                candidates.add(folder)
+        try:
+            for folder in self.source_path.iterdir():
+                if not folder.is_dir():
+                    continue
+                name = folder.name
+                if len(name) >= 2 and name[0].isdigit() and name[1].isdigit():
+                    candidates.add(folder)
+        except Exception:
+            # If scanning fails, skip fallback
+            pass
 
         # OS hidden system files to ignore
         ignored_files = {'.ds_store', 'thumbs.db', 'desktop.ini'}
 
         for folder in candidates:
-            if not folder.is_dir(): continue
+            if not folder.is_dir():
+                continue
 
             try:
                 is_conceptually_empty = True
@@ -226,8 +289,7 @@ class FileGrouper:
                         is_conceptually_empty = False
                         break
                     # Ignore system files and Office temporary files (~$) or Mac AppleDouble (._)
-                    if item.name.lower() not in ignored_files and not item.name.startswith(
-                            '~$') and not item.name.startswith('._'):
+                    if item.name.lower() not in ignored_files and not item.name.startswith('~$') and not item.name.startswith('._'):
                         is_conceptually_empty = False
                         break
 
@@ -240,8 +302,9 @@ class FileGrouper:
                                 log_callback(f"Cleaned up empty folder: {folder.name}", "INFO")
                             break
                         time.sleep(0.1)  # Brief pause before retry
-            except Exception:
-                pass  # Fail silently if the OS simply refuses to yield the lock
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"Cleanup failed for {folder.name}: {e}", "WARN")
 
     def _load_log(self) -> List[dict]:
         try:
@@ -251,11 +314,15 @@ class FileGrouper:
             return []
 
     def _save_log(self, data: List[dict]):
-        if data:
-            with open(self.log_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        elif self.log_path.exists():
-            self.log_path.unlink(missing_ok=True)
+        try:
+            if data:
+                with open(self.log_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            elif self.log_path.exists():
+                self.log_path.unlink(missing_ok=True)
+        except Exception:
+            # Propagate exception to caller to handle rollback if needed
+            raise
 
 
 class FileGrouperApp:
@@ -273,7 +340,11 @@ class FileGrouperApp:
         self.grouper: Optional[FileGrouper] = None
 
         self.master.title("File Grouper by Prefix - Enterprise Edition")
-        self.master.geometry("1024x820")
+        # Allow window manager to pick a sensible size if not available
+        try:
+            self.master.geometry("1024x820")
+        except Exception:
+            pass
         self.master.resizable(True, True)
 
         self.create_widgets()
@@ -329,8 +400,13 @@ class FileGrouperApp:
         self.custom_names_text.pack(fill="x", pady=2)
         self.custom_names_text.insert(tk.END, "ACS\nDelta\nED\nOP\nBGM")
 
-        self.master.drop_target_register(DND_FILES)
-        self.master.dnd_bind('<<Drop>>', self.on_drop)
+        if HAS_DND:
+            try:
+                self.master.drop_target_register(DND_FILES)
+                self.master.dnd_bind('<<Drop>>', self.on_drop)
+            except Exception:
+                # If DnD registration fails, continue without it
+                pass
 
         btn_frame = tk.Frame(self.master)
         btn_frame.pack(pady=10)
@@ -366,34 +442,58 @@ class FileGrouperApp:
         self.status_label = tk.Label(self.master, text="Ready for operation...", fg="gray", anchor="w")
         self.status_label.pack(fill="x", padx=20, pady=5)
 
+        # Configure tags once
+        self._setup_log_tags()
+
+    def _setup_log_tags(self):
+        try:
+            self.preview_text.tag_config("info", foreground="#d4d4d4")
+            self.preview_text.tag_config("success", foreground="#4CAF50", font=("Consolas", 10, "bold"))
+            self.preview_text.tag_config("warn", foreground="#FFEB3B")
+            self.preview_text.tag_config("error", foreground="#f44336", font=("Consolas", 10, "bold"))
+        except Exception:
+            # Tag setup is non-critical on some platforms
+            pass
+
     def log_safe(self, message: str, level: str = "INFO"):
-        self.master.after(0, self.log, message, level)
+        try:
+            self.master.after(0, self.log, message, level)
+        except Exception:
+            # In case master is not available, print to stdout as fallback
+            print(f"{level}: {message}")
 
     def update_progress_safe(self, current: int, total: int, filename: str = ""):
-        self.master.after(0, self.update_progress, current, total, filename)
+        try:
+            self.master.after(0, self.update_progress, current, total, filename)
+        except Exception:
+            pass
 
     def set_buttons_state(self, state="normal"):
-        self.browse_btn.config(state=state)
-        self.preview_btn.config(state=state)
-        self.execute_btn.config(state=state if self.execute_btn['state'] != 'disabled' else 'disabled')
-        self.undo_btn.config(state=state if self.undo_btn['state'] != 'disabled' else 'disabled')
-        self.export_btn.config(state=state)
+        try:
+            self.browse_btn.config(state=state)
+            self.preview_btn.config(state=state)
+            self.execute_btn.config(state=state if self.execute_btn['state'] != 'disabled' else 'disabled')
+            self.undo_btn.config(state=state if self.undo_btn['state'] != 'disabled' else 'disabled')
+            self.export_btn.config(state=state)
+        except Exception:
+            pass
 
     def log(self, message: str, level: str = "INFO"):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         prefix = f"[{timestamp}] {level}: "
 
         tag = level.lower()
-        self.preview_text.tag_config("info", foreground="#d4d4d4")
-        self.preview_text.tag_config("success", foreground="#4CAF50", font=("Consolas", 10, "bold"))
-        self.preview_text.tag_config("warn", foreground="#FFEB3B")
-        self.preview_text.tag_config("error", foreground="#f44336", font=("Consolas", 10, "bold"))
-
-        self.preview_text.insert(tk.END, prefix + message + "\n", tag)
-        self.preview_text.see(tk.END)
+        try:
+            self.preview_text.insert(tk.END, prefix + message + "\n", tag)
+            self.preview_text.see(tk.END)
+        except Exception:
+            # fallback to stdout
+            print(prefix + message)
 
     def export_log(self):
-        if not self.source_path: return
+        if not self.source_path:
+            messagebox.showwarning("No folder", "Please load a folder before exporting the log.")
+            return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = self.source_path / f"audit_log_{ts}.txt"
         try:
@@ -404,32 +504,49 @@ class FileGrouperApp:
             messagebox.showerror("Export Failed", str(e))
 
     def on_drop(self, event):
-        path = event.data.strip('{}')
-        if os.path.isdir(path):
-            self.load_folder(path)
+        try:
+            path_raw = event.data
+            path = path_raw.strip('{}').strip()
+            if path and os.path.isdir(path):
+                self.load_folder(path)
+            else:
+                messagebox.showwarning("Invalid Drop", "Please drop a valid folder.")
+        except Exception as e:
+            messagebox.showerror("Drop Error", f"Failed to load folder: {e}")
 
     def browse_folder(self):
         folder = filedialog.askdirectory(title="Select Source Folder")
-        if folder: self.load_folder(folder)
+        if folder:
+            self.load_folder(folder)
 
     def load_folder(self, folder_path: str):
-        self.source_path = Path(folder_path).resolve()
-        self.source_var.set(str(self.source_path))
-        self.grouper = FileGrouper(self.source_path)
+        try:
+            path = Path(folder_path).resolve()
+            if not path.exists() or not path.is_dir():
+                messagebox.showerror("Error", "Folder does not exist!")
+                return
+            self.source_path = path
+            self.source_var.set(str(self.source_path))
+            self.grouper = FileGrouper(self.source_path)
 
-        self.preview_text.delete(1.0, tk.END)
-        self.reset_progress()
+            self.preview_text.delete(1.0, tk.END)
+            self.reset_progress()
 
-        undo_state = "normal" if self.grouper.log_path.exists() else "disabled"
-        self.undo_btn.config(state=undo_state)
-        self.execute_btn.config(state="disabled")
+            undo_state = "normal" if self.grouper.log_path.exists() else "disabled"
+            self.undo_btn.config(state=undo_state)
+            self.execute_btn.config(state="disabled")
 
-        self.log(f"Folder loaded: {self.source_path.name}", "INFO")
-        self.status_label.config(text=f"Loaded: {self.source_path.name}", fg="green")
+            self.log(f"Folder loaded: {self.source_path.name}", "INFO")
+            self.status_label.config(text=f"Loaded: {self.source_path.name}", fg="green")
+        except Exception as e:
+            messagebox.showerror("Load Failed", str(e))
 
     def reset_progress(self):
-        self.progress_bar['value'] = 0
-        self.progress_label.config(text="Progress: Ready")
+        try:
+            self.progress_bar['value'] = 0
+            self.progress_label.config(text="Progress: Ready")
+        except Exception:
+            pass
 
     def update_progress(self, current: int, total: int, filename: str = ""):
         if total > 0:
@@ -443,7 +560,14 @@ class FileGrouperApp:
 
     def get_custom_names(self) -> List[str]:
         text = self.custom_names_text.get(1.0, tk.END).strip()
-        return [line.strip() for line in text.splitlines() if line.strip()]
+        names = [line.strip() for line in text.splitlines() if line.strip()]
+        # Validate against reserved filesystem chars
+        invalid_chars = r'[\\/:\\*?"<>|]'
+        for name in names:
+            if re.search(invalid_chars, name):
+                messagebox.showwarning("Invalid Name", f"Folder name '{name}' contains invalid characters")
+                return []
+        return names
 
     def preview_groups(self):
         if not self.source_path or not self.grouper:
@@ -478,8 +602,23 @@ class FileGrouperApp:
         self.execute_btn.config(state="normal" if total_files > 0 else "disabled")
 
     def execute_move(self):
-        if not self.source_path or not self.grouper: return
-        if not messagebox.askyesno("Confirm", "Confirm start moving files?"): return
+        if not self.source_path or not self.grouper:
+            return
+
+        # compute groups and totals for confirmation
+        suffix = self.suffix_var.get().strip()
+        use_numbering = self.numbering_var.get()
+        custom_names = self.get_custom_names()
+        case_sensitive = self.case_sensitive_var.get()
+        groups = self.grouper.preview_groups(self.filter_var.get(), suffix, use_numbering, custom_names, case_sensitive)
+        total_files = sum(len(files) for files in groups.values())
+        if total_files == 0:
+            messagebox.showinfo("Nothing to do", "No files matched the filter/prefix criteria.")
+            return
+
+        msg = f"You are about to move {total_files} files into {len(groups)} folders.\n\nContinue?"
+        if not messagebox.askyesno("Confirm", msg):
+            return
 
         self.set_buttons_state("disabled")
         self.log("=== MOVE OPERATION START ===", "INFO")
@@ -488,20 +627,24 @@ class FileGrouperApp:
         threading.Thread(target=self._execute_move_thread, daemon=True).start()
 
     def _execute_move_thread(self):
-        filter_text = self.filter_var.get()
-        suffix = self.suffix_var.get().strip()
-        use_numbering = self.numbering_var.get()
-        custom_names = self.get_custom_names()
-        case_sensitive = self.case_sensitive_var.get()
-        conflict_policy = self.conflict_policy_var.get()
+        try:
+            filter_text = self.filter_var.get()
+            suffix = self.suffix_var.get().strip()
+            use_numbering = self.numbering_var.get()
+            custom_names = self.get_custom_names()
+            case_sensitive = self.case_sensitive_var.get()
+            conflict_policy = self.conflict_policy_var.get()
 
-        moved, skipped, renamed, errors = self.grouper.execute_move(
-            filter_text, suffix, use_numbering, custom_names, case_sensitive, conflict_policy,
-            progress_callback=self.update_progress_safe,
-            log_callback=self.log_safe
-        )
+            moved, skipped, renamed, errors = self.grouper.execute_move(
+                filter_text, suffix, use_numbering, custom_names, case_sensitive, conflict_policy,
+                progress_callback=self.update_progress_safe,
+                log_callback=self.log_safe
+            )
 
-        self.master.after(0, self._on_execute_complete, moved, skipped, renamed, errors)
+            self.master.after(0, self._on_execute_complete, moved, skipped, renamed, errors)
+        except Exception as e:
+            self.log_safe(f"Critical error during move: {e}", "ERROR")
+            self.master.after(0, self.set_buttons_state, "normal")
 
     def _on_execute_complete(self, moved, skipped, renamed, errors):
         self.log(f"SUMMARY: Moved {moved} | Auto-Renamed {renamed} | Skipped {skipped} | Errors {errors}", "SUCCESS")
@@ -513,13 +656,17 @@ class FileGrouperApp:
         self.reset_progress()
 
         msg = f"Successfully grouped {moved + renamed} files.\n"
-        if skipped > 0: msg += f"Skipped {skipped} conflicts.\n"
-        if errors > 0: msg += f"Errors on {errors} files (check log)."
+        if skipped > 0:
+            msg += f"Skipped {skipped} conflicts.\n"
+        if errors > 0:
+            msg += f"Errors on {errors} files (check log)."
         messagebox.showinfo("Operation Complete", msg)
 
     def undo_last_move(self):
-        if not self.grouper: return
-        if not messagebox.askyesno("Confirm", "Undo the LAST batch of moves?"): return
+        if not self.grouper:
+            return
+        if not messagebox.askyesno("Confirm", "Undo the LAST batch of moves?"):
+            return
 
         self.set_buttons_state("disabled")
         self.log("=== UNDO OPERATION START ===", "INFO")
@@ -528,11 +675,15 @@ class FileGrouperApp:
         threading.Thread(target=self._undo_thread, daemon=True).start()
 
     def _undo_thread(self):
-        undone, remaining_logs = self.grouper.undo_last_move(
-            progress_callback=self.update_progress_safe,
-            log_callback=self.log_safe
-        )
-        self.master.after(0, self._on_undo_complete, undone, remaining_logs)
+        try:
+            undone, remaining_logs = self.grouper.undo_last_move(
+                progress_callback=self.update_progress_safe,
+                log_callback=self.log_safe
+            )
+            self.master.after(0, self._on_undo_complete, undone, remaining_logs)
+        except Exception as e:
+            self.log_safe(f"Critical error during undo: {e}", "ERROR")
+            self.master.after(0, self.set_buttons_state, "normal")
 
     def _on_undo_complete(self, undone, remaining_logs):
         self.log(f"SUMMARY: Restored {undone} files | {remaining_logs} records remaining", "SUCCESS")
@@ -543,11 +694,13 @@ class FileGrouperApp:
         self.set_buttons_state("normal")
         self.undo_btn.config(state="normal" if remaining_logs > 0 else "disabled")
         self.reset_progress()
-        messagebox.showinfo("Undo Success",
-                            f"Successfully restored {undone} files.\nCleaned up residual empty folders.")
+        messagebox.showinfo("Undo Success", f"Successfully restored {undone} files.\nCleaned up residual empty folders.")
 
 
 if __name__ == "__main__":
-    root = TkinterDnD.Tk()
+    if not HAS_DND:
+        print("Warning: tkinterdnd2 not available; drag-and-drop disabled. Install with: pip install tkinterdnd2")
+    # Use Tk from tkinterdnd2 if available to enable DND support, otherwise fall back to tk.Tk
+    root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
     app = FileGrouperApp(root)
     root.mainloop()
